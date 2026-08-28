@@ -75,6 +75,7 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.speculative.semantic_adaptive_tokens import SemanticAdaptiveTokenMixer
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
@@ -458,6 +459,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # eager optimizer step has supplied representative runtime inputs.
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+        # Replaced by the configured mixer in setup() when the opt-in ``sdsat:``
+        # block is present; declared here so the train/val step helpers have a
+        # stable attribute to consult.
+        self.sdsat_mixer: SemanticAdaptiveTokenMixer | None = None
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -538,6 +543,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "The magi HF backend needs full logits and is incompatible with "
                 "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
             )
+
+        # Optional semantic-adaptive-token (SAT) mixing for self-speculative fine-tuning (sdsat: block)
+        if self.cfg.sdsat is not None:
+            if self.pp_enabled:
+                raise ValueError("sdsat (semantic adaptive tokens) is not supported with pipeline parallelism.")
+            if self.cfg.dataloader is not None and self.cfg.dataloader.emits_thd:
+                raise ValueError("sdsat (semantic adaptive tokens) is not supported with THD-packed dataloaders.")
+            self.sdsat_mixer = self.cfg.sdsat.build()
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
@@ -1013,6 +1026,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
+    def _countable_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        """Return the label tensor whose non-ignored entries normalize the loss.
+
+        Args:
+            labels: Tensor of shape [batch, sequence] holding the batch's
+                pre-shifted LM targets.
+
+        Returns:
+            The SAT-mixed labels of shape [batch, sequence * (k + 1)] when the
+            ``sdsat:`` block is enabled, otherwise ``labels`` unchanged.
+        """
+        mixer = getattr(self, "sdsat_mixer", None)
+        return mixer.mix_labels(labels) if mixer is not None else labels
+
     def _forward_backward_step(
         self,
         idx,
@@ -1032,6 +1059,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        sdsat_mixer = getattr(self, "sdsat_mixer", None)
+        if sdsat_mixer is not None:
+            batch = sdsat_mixer(batch)
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
         mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
         mtp_cp_inputs = None
@@ -1208,7 +1238,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
 
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum((self._countable_labels(batch["labels"]) != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
@@ -1359,7 +1389,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             for batch in val_dataloader:
                 loss_buffer = []
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = (self._countable_labels(batch["labels"]) != -100).sum().item()
                 self._forward_backward_step(
                     0,
                     batch,

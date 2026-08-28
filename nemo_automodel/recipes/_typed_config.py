@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.speculative.semantic_adaptive_tokens import SemanticAdaptiveTokenConfig
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
 
@@ -612,6 +613,14 @@ class RecipeConfig:
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
         return MTPLossConfig()
+
+    @cached_property
+    def sdsat(self) -> "SemanticAdaptiveTokenConfig | None":
+        """Typed config for the optional ``sdsat:`` semantic-adaptive-token block."""
+        from nemo_automodel.components.speculative.semantic_adaptive_tokens import SemanticAdaptiveTokenConfig
+
+        node = self._raw.get("sdsat", None)
+        return SemanticAdaptiveTokenConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":
